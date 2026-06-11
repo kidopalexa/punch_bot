@@ -274,7 +274,7 @@ async def handle_free_text(message: Message, state: FSMContext) -> None:
         return
 
     summary = await _goals_summary(message.from_user.id)
-    reply = await ai_services.coach_coach_answer(message.text, summary)
+    reply = await ai_services.coach_coach_reply(message.text, summary)
     await message.answer(f"🤖 <b>Коуч:</b>\n\n{reply}")
     await _send_sticker_or_emoji(message, "coach")
 
