@@ -8,16 +8,12 @@ def punch_keyboard() -> InlineKeyboardMarkup:
 
 
 def goals_select_keyboard(goals: list[tuple]) -> InlineKeyboardMarkup:
-    """
-    goals: list of (id, goal_name, target_count, current_count, last_punch_date)
-    Один рядок = одна ціль.
-    """
     rows = []
-    for goal_id, name, target, current, _ in goals:
-        label = f"{name}  {current}/{target}"
+    for goal in goals:
+        goal_id, name, target, current = goal[0], goal[1], goal[2], goal[3]
         rows.append([
             InlineKeyboardButton(
-                text=label,
+                text=f"{name}  {current}/{target}",
                 callback_data=f"punch_goal:{goal_id}"
             )
         ])
