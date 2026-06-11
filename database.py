@@ -226,3 +226,12 @@ async def punch_challenge(challenge_id: int, user_id: int) -> tuple[int, int, bo
             )
         await db.commit()
     return new_count, target, is_winner
+
+
+async def get_all_active_user_ids() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT DISTINCT user_id FROM goals WHERE current_count < target_count"
+        ) as cur:
+            rows = await cur.fetchall()
+    return [r[0] for r in rows]

@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import date
 
 from aiogram import Router, F, Bot
@@ -13,9 +14,36 @@ import database as db
 import utils
 import keyboards as kb
 import ai_services
-from states import GoalCreation, ChallengeCreation, CoachDialog
+import stickers
+from voice import transcribe_voice
+from states import GoalCreation, ChallengeCreation
 
 router = Router()
+
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _send_sticker_or_emoji(message: Message, category: str) -> None:
+    file_id = stickers.get_sticker_id(category)
+    if file_id:
+        try:
+            await message.answer_sticker(file_id)
+            return
+        except Exception:
+            pass
+    # fallback — просто емодзі в наступному повідомленні не потрібен,
+    # емодзі вже вбудовані в текст
+
+
+async def _goals_summary(user_id: int) -> str:
+    goals = await db.get_user_goals(user_id)
+    if not goals:
+        return "немає активних цілей"
+    return ", ".join(f"{g[1]} ({g[3]}/{g[2]})" for g in goals)
 
 
 # ---------------------------------------------------------------------------
@@ -26,17 +54,16 @@ router = Router()
 async def cmd_start(message: Message) -> None:
     manifesto = (
         "🏴 <b>ПУНШ-КАРТА ДИСЦИПЛІНИ</b>\n\n"
-        "Цей бот не буде тебе жаліти чи мотивувати. "
-        "Мотивація зникає після першого ж важкого дня. "
-        "Залишається лише система і звітність.\n\n"
-        "<b>Команди:</b>\n"
+        "Твій особистий AI-коуч і трекер цілей в одному боті.\n\n"
+        "<b>Основні команди:</b>\n"
         "/goal — створити нову ціль\n"
         "/punch — пробити пунш\n"
         "/status — переглянути всі цілі\n"
-        "/delete — видалити ціль\n"
-        "/coach — запитати AI-коуча\n"
-        "/challenge — кинути виклик другу\n"
-        "/mystats — моя статистика"
+        "/mystats — статистика і бейджі\n"
+        "/challenge — виклик другу\n"
+        "/delete — видалити ціль\n\n"
+        "<b>💬 Або просто напиши мені будь-що</b> — відповім як коуч.\n"
+        "<b>🎤 Надішли голосове</b> — розпізнаю і запишу пунш або відповім."
     )
     photo_path = "cover.jpg"
     if os.path.exists(photo_path):
@@ -55,7 +82,7 @@ async def cmd_goal(message: Message, state: FSMContext) -> None:
     if count >= db.MAX_GOALS_PER_USER:
         await message.answer(
             f"❌ Максимум {db.MAX_GOALS_PER_USER} цілі. "
-            "Видали одну через /delete, щоб додати нову."
+            "Видали одну через /delete."
         )
         return
     await state.set_state(GoalCreation.waiting_for_name)
@@ -75,7 +102,7 @@ async def goal_name_received(message: Message, state: FSMContext) -> None:
     await state.update_data(goal_name=name)
     await state.set_state(GoalCreation.waiting_for_count)
     await message.answer(
-        f"Ціль: <b>{name}</b>\n\nСкільки пунш-слотів? (1–60)\nПриклад: <code>30</code>",
+        f"Ціль: <b>{name}</b>\n\nСкільки пунш-слотів? (1–60)",
         reply_markup=kb.cancel_keyboard(),
     )
 
@@ -131,9 +158,7 @@ async def process_inline_punch(callback: CallbackQuery) -> None:
         await callback.answer("Ціль не знайдена.", show_alert=True)
         return
     today = date.today().isoformat()
-    target_goal = next(
-        (g for g in goals if g[3] < g[2] and g[4] != today), None
-    )
+    target_goal = next((g for g in goals if g[3] < g[2] and g[4] != today), None)
     if target_goal is None:
         await callback.answer("Всі відмічені сьогодні. Повертайся завтра.", show_alert=True)
         return
@@ -163,23 +188,95 @@ async def _do_punch(message: Message, goal_id: int, edit: bool = False) -> None:
 
     # Бейдж за серію
     badge_text = ""
+    sticker_cat = "punch"
     if new_streak in db.STREAK_BADGES:
-        badge_text = f"\n\n🎖 <b>{db.STREAK_BADGES[new_streak]}</b> — так тримати!"
+        badge_text = f"\n\n🎖 <b>{db.STREAK_BADGES[new_streak]}</b>"
+        sticker_cat = f"streak_{new_streak}"
 
     text = f"{card}\n\n<i>{ai_comment}</i>{badge_text}"
 
     if new_count >= g_target:
+        sticker_cat = "finish"
         if edit:
             await message.edit_text(text)
         else:
             await message.answer(text)
-        await message.answer(f"🔥 Фініш! Ціль <b>{g_name}</b> закрита.")
+        await message.answer(f"🔥 Фініш! Ціль <b>{g_name}</b> закрита!")
+        await _send_sticker_or_emoji(message, sticker_cat)
         await db.delete_goal(goal_id)
     else:
         if edit:
             await message.edit_text(text, reply_markup=kb.punch_keyboard())
         else:
             await message.answer(text, reply_markup=kb.punch_keyboard())
+        await _send_sticker_or_emoji(message, sticker_cat)
+
+
+# ---------------------------------------------------------------------------
+# 🎤 Голосові повідомлення
+# ---------------------------------------------------------------------------
+
+@router.message(F.voice)
+async def handle_voice(message: Message, bot: Bot) -> None:
+    await message.answer("🎤 Розпізнаю...")
+    file = await bot.get_file(message.voice.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    raw = file_bytes.read() if hasattr(file_bytes, "read") else bytes(file_bytes)
+    text = await transcribe_voice(raw)
+
+    if not text:
+        await message.answer("Не вдалося розпізнати. Спробуй ще раз або напиши текстом.")
+        return
+
+    await message.answer(f"🗣 <i>Розпізнано:</i> {text}")
+
+    # Визначаємо намір
+    goals = await db.get_user_goals(message.from_user.id)
+    summary = await _goals_summary(message.from_user.id)
+    intent_data = await ai_services.voice_intent(text, summary)
+    intent = intent_data.get("intent", "other")
+    goal_hint = intent_data.get("goal_hint", "")
+
+    if intent == "punch" and goals:
+        # Знаходимо найближчу ціль за підказкою
+        today = date.today().isoformat()
+        matched = None
+        for g in goals:
+            if g[3] < g[2] and g[4] != today:
+                if goal_hint.lower() in g[1].lower() or g[1].lower() in goal_hint.lower():
+                    matched = g
+                    break
+        if not matched:
+            # Беремо першу доступну
+            matched = next((g for g in goals if g[3] < g[2] and g[4] != today), None)
+
+        if matched:
+            await message.answer(f"✅ Записую пунш для цілі <b>{matched[1]}</b>!")
+            await _do_punch(message, matched[0])
+        else:
+            await message.answer("Всі цілі вже відмічені сьогодні 👏")
+    else:
+        # Відповідаємо як коуч
+        reply = await ai_services.coach_reply(text, summary)
+        await message.answer(f"🤖 <b>Коуч:</b>\n\n{reply}")
+        await _send_sticker_or_emoji(message, "coach")
+
+
+# ---------------------------------------------------------------------------
+# 💬 AI-коуч на будь-яке текстове повідомлення
+# ---------------------------------------------------------------------------
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_free_text(message: Message, state: FSMContext) -> None:
+    # Не перехоплюємо якщо є активний FSM стан
+    current_state = await state.get_state()
+    if current_state:
+        return
+
+    summary = await _goals_summary(message.from_user.id)
+    reply = await ai_services.coach_reply(message.text, summary)
+    await message.answer(f"🤖 <b>Коуч:</b>\n\n{reply}")
+    await _send_sticker_or_emoji(message, "coach")
 
 
 # ---------------------------------------------------------------------------
@@ -257,59 +354,42 @@ async def process_delete(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /coach — AI коуч
-# ---------------------------------------------------------------------------
-
-@router.message(Command("coach"))
-async def cmd_coach(message: Message, state: FSMContext) -> None:
-    await state.set_state(CoachDialog.waiting_for_question)
-    await message.answer(
-        "🤖 <b>AI-коуч</b>\n\nЗадай своє питання про цілі, дисципліну або мотивацію:",
-        reply_markup=kb.cancel_keyboard(),
-    )
-
-
-@router.message(CoachDialog.waiting_for_question)
-async def coach_question_received(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    goals = await db.get_user_goals(message.from_user.id)
-    goals_summary = ", ".join(f"{g[1]} ({g[3]}/{g[2]})" for g in goals) or "немає активних цілей"
-    await message.answer("⏳ Думаю...")
-    answer = await ai_services.coach_answer(message.text, goals_summary)
-    await message.answer(f"🤖 <b>Коуч:</b>\n\n{answer}")
-
-
-# ---------------------------------------------------------------------------
-# /challenge — челендж з другом
+# /challenge
 # ---------------------------------------------------------------------------
 
 @router.message(Command("challenge"))
 async def cmd_challenge(message: Message, state: FSMContext) -> None:
+    from states import ChallengeCreation
     await state.set_state(ChallengeCreation.waiting_for_opponent)
     await message.answer(
-        "👥 <b>Челендж</b>\n\nПопроси друга написати боту /start, "
-        "потім введи його Telegram ID.\n\n"
-        "Як дізнатись ID друга: нехай напише @userinfobot",
+        "👥 <b>Челендж</b>\n\nВведи Telegram ID суперника.\n"
+        "Як дізнатись ID: нехай напише <b>@userinfobot</b>",
         reply_markup=kb.cancel_keyboard(),
     )
 
 
-@router.message(ChallengeCreation.waiting_for_opponent)
-async def challenge_opponent_received(message: Message, state: FSMContext) -> None:
+@router.message(F.text, lambda m: True)
+async def _challenge_opponent(message: Message, state: FSMContext) -> None:
+    from states import ChallengeCreation
+    if await state.get_state() != ChallengeCreation.waiting_for_opponent:
+        return
     try:
         opponent_id = int(message.text.strip())
         if opponent_id == message.from_user.id:
             raise ValueError
     except ValueError:
-        await message.answer("Введи коректний числовий Telegram ID іншої людини.")
+        await message.answer("Введи коректний числовий Telegram ID.")
         return
     await state.update_data(opponent_id=opponent_id)
     await state.set_state(ChallengeCreation.waiting_for_goal_name)
-    await message.answer("Введи назву спільної цілі (з емодзі):", reply_markup=kb.cancel_keyboard())
+    await message.answer("Введи назву спільної цілі:", reply_markup=kb.cancel_keyboard())
 
 
-@router.message(ChallengeCreation.waiting_for_goal_name)
-async def challenge_goal_name_received(message: Message, state: FSMContext) -> None:
+@router.message(F.text, lambda m: True)
+async def _challenge_goal(message: Message, state: FSMContext) -> None:
+    from states import ChallengeCreation
+    if await state.get_state() != ChallengeCreation.waiting_for_goal_name:
+        return
     name = message.text.strip()
     if not name or len(name) > 64:
         await message.answer("Назва 1–64 символи.")
@@ -319,8 +399,11 @@ async def challenge_goal_name_received(message: Message, state: FSMContext) -> N
     await message.answer("Скільки пунш-слотів? (1–60)", reply_markup=kb.cancel_keyboard())
 
 
-@router.message(ChallengeCreation.waiting_for_count)
-async def challenge_count_received(message: Message, state: FSMContext, bot: Bot) -> None:
+@router.message(F.text, lambda m: True)
+async def _challenge_count(message: Message, state: FSMContext, bot: Bot) -> None:
+    from states import ChallengeCreation
+    if await state.get_state() != ChallengeCreation.waiting_for_count:
+        return
     try:
         target = int(message.text.strip())
         if not (1 <= target <= 60):
@@ -330,27 +413,21 @@ async def challenge_count_received(message: Message, state: FSMContext, bot: Bot
         return
     data = await state.get_data()
     await state.clear()
-
-    opponent_id: int = data["opponent_id"]
-    goal_name: str = data["goal_name"]
+    opponent_id = data["opponent_id"]
+    goal_name = data["goal_name"]
     challenge_id = await db.create_challenge(goal_name, target, message.from_user.id, opponent_id)
-
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Приймаю виклик!", callback_data=f"accept_challenge:{challenge_id}")
     ]])
-    initiator = message.from_user.full_name or "Хтось"
     try:
+        initiator = message.from_user.full_name or "Хтось"
         await bot.send_message(
             opponent_id,
             f"⚔️ <b>{initiator}</b> кидає тобі виклик!\n\n"
-            f"Ціль: <b>{goal_name}</b> ({target} пунш-слотів)\n"
-            f"Хто закриє ціль першим — той переможець.",
+            f"Ціль: <b>{goal_name}</b> ({target} слотів)\nХто перший — переможець.",
             reply_markup=markup,
         )
-        await message.answer(
-            f"✅ Виклик відправлено! Чекай підтвердження від суперника.\n"
-            f"ID челенджу: <code>{challenge_id}</code>"
-        )
+        await message.answer(f"✅ Виклик відправлено! ID: <code>{challenge_id}</code>")
     except Exception:
         await message.answer("❌ Не вдалося написати суперникові. Перевір ID.")
 
@@ -362,23 +439,15 @@ async def accept_challenge(callback: CallbackQuery, bot: Bot) -> None:
     if not ch:
         await callback.answer("Челендж не знайдено.", show_alert=True)
         return
-
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Пунш у челенджі", callback_data=f"challenge_punch:{challenge_id}")
     ]])
     await callback.message.edit_text(
-        f"⚔️ <b>Челендж прийнято!</b>\n\n"
-        f"Ціль: <b>{ch[1]}</b> ({ch[2]} слотів)\n"
-        f"Щодня тисни кнопку нижче.",
+        f"⚔️ <b>Челендж прийнято!</b>\nЦіль: <b>{ch[1]}</b> ({ch[2]} слотів)",
         reply_markup=markup,
     )
     try:
-        await bot.send_message(
-            ch[3],
-            f"⚔️ Суперник прийняв челендж <b>{ch[1]}</b>! Починаємо!\n"
-            f"ID: <code>{challenge_id}</code>\n"
-            f"Пиши /challengestatus щоб бачити рахунок.",
-        )
+        await bot.send_message(ch[3], f"⚔️ Суперник прийняв челендж <b>{ch[1]}</b>!")
     except Exception:
         pass
     await callback.answer()
@@ -388,33 +457,22 @@ async def accept_challenge(callback: CallbackQuery, bot: Bot) -> None:
 async def challenge_punch(callback: CallbackQuery, bot: Bot) -> None:
     challenge_id = int(callback.data.split(":")[1])
     new_count, target, is_winner = await db.punch_challenge(challenge_id, callback.from_user.id)
-
     if new_count == 0:
         await callback.answer("Вже пробив сьогодні!", show_alert=True)
         return
-
     ch = await db.get_challenge(challenge_id)
     opponent_id = ch[4] if callback.from_user.id == ch[3] else ch[3]
-
     if is_winner:
-        await callback.message.edit_text(
-            f"🏆 <b>Ти переміг у челенджі «{ch[1]}»!</b>\n"
-            f"Результат: {new_count}/{target}"
-        )
+        await callback.message.edit_text(f"🏆 <b>Ти переміг у челенджі «{ch[1]}»!</b>")
+        await _send_sticker_or_emoji(callback.message, "finish")
         try:
-            await bot.send_message(
-                opponent_id,
-                f"😔 Суперник переміг у челенджі <b>{ch[1]}</b>. Наступного разу пощастить."
-            )
+            await bot.send_message(opponent_id, f"😔 Суперник переміг у челенджі <b>{ch[1]}</b>.")
         except Exception:
             pass
     else:
         await callback.answer(f"✅ Пунш! {new_count}/{target}")
         try:
-            await bot.send_message(
-                opponent_id,
-                f"⚔️ Суперник пробив пунш у челенджі <b>{ch[1]}</b>. Рахунок: {new_count}/{target}"
-            )
+            await bot.send_message(opponent_id, f"⚔️ Суперник пробив пунш! Рахунок: {new_count}/{target}")
         except Exception:
             pass
 
@@ -427,13 +485,27 @@ async def cmd_challenge_status(message: Message) -> None:
         return
     for ch in challenges:
         _, goal, target, u1, u2, u1c, u2c, _, _, _, _ = ch
-        you_count = u1c if message.from_user.id == u1 else u2c
-        opp_count = u2c if message.from_user.id == u1 else u1c
-        await message.answer(
-            f"⚔️ <b>Челендж: {goal}</b>\n"
-            f"Ти: {you_count}/{target}\n"
-            f"Суперник: {opp_count}/{target}"
-        )
+        you = u1c if message.from_user.id == u1 else u2c
+        opp = u2c if message.from_user.id == u1 else u1c
+        await message.answer(f"⚔️ <b>{goal}</b>\nТи: {you}/{target} | Суперник: {opp}/{target}")
+
+
+# ---------------------------------------------------------------------------
+# /loadstickers — адмін команда для завантаження стікерів
+# ---------------------------------------------------------------------------
+
+@router.message(Command("loadstickers"))
+async def cmd_load_stickers(message: Message, bot: Bot) -> None:
+    if ADMIN_ID and message.from_user.id != ADMIN_ID:
+        return
+    sticker_set = await bot.get_sticker_set("NEWLIFE3_by_fStikBot")
+    categories = list(stickers.STICKER_CATEGORIES.keys())
+    loaded = 0
+    for i, sticker in enumerate(sticker_set.stickers):
+        if i < len(categories):
+            await stickers.save_sticker(categories[i], sticker.file_id)
+            loaded += 1
+    await message.answer(f"✅ Завантажено {loaded} стікерів з паку NEWLIFE3.")
 
 
 # ---------------------------------------------------------------------------

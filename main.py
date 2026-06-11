@@ -12,13 +12,30 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import database as db
 import ai_services
+import stickers
 from handlers import router
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 
 
+async def send_morning_briefing(bot: Bot) -> None:
+    """Ранковий брифінг о 9:00 для всіх активних юзерів."""
+    all_users = await db.get_all_active_user_ids()
+    for user_id in all_users:
+        try:
+            goals = await db.get_user_goals(user_id)
+            text = await ai_services.morning_briefing(goals)
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"☀️ <b>Ранковий брифінг</b>\n\n{text}",
+            )
+        except Exception as exc:
+            logging.error("Briefing error %s: %s", user_id, exc)
+
+
 async def send_daily_reminders(bot: Bot) -> None:
+    """Вечірні нагадування о 20:00."""
     pending = await db.get_users_pending_punch()
     for user_id, goal_name in pending:
         try:
@@ -28,12 +45,12 @@ async def send_daily_reminders(bot: Bot) -> None:
                 text=f"⚠️ <b>Системне нагадування</b>\n\n{text}",
             )
         except Exception as exc:
-            logging.error("Не вдалося відправити нагадування %s: %s", user_id, exc)
+            logging.error("Reminder error %s: %s", user_id, exc)
 
 
 async def main() -> None:
     if not TOKEN:
-        logging.error("BOT_TOKEN не знайдено в .env!")
+        logging.error("BOT_TOKEN не знайдено!")
         sys.exit(1)
 
     logging.basicConfig(
@@ -43,26 +60,17 @@ async def main() -> None:
     )
 
     await db.init_db()
+    await stickers.init_stickers_db()
 
-    bot = Bot(
-        token=TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    # MemoryStorage для FSM (замінити на RedisStorage у проді)
+    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Планувальник — щодня о 20:00 за берлінським часом
     scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
-    scheduler.add_job(
-        send_daily_reminders,
-        trigger="cron",
-        hour=20,
-        minute=0,
-        kwargs={"bot": bot},
-    )
+    scheduler.add_job(send_morning_briefing, "cron", hour=9, minute=0, kwargs={"bot": bot})
+    scheduler.add_job(send_daily_reminders, "cron", hour=20, minute=0, kwargs={"bot": bot})
     scheduler.start()
-    logging.info("Scheduler started. Reminders at 20:00 Europe/Berlin.")
+    logging.info("Scheduler started.")
 
     try:
         await dp.start_polling(bot)
